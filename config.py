@@ -7,7 +7,6 @@ During the hackathon, students should NOT modify these values.
 The purpose is to ensure that every team solves the same problem.
 """
 
-
 # ============================================================
 # ENVIRONMENT
 # ============================================================
