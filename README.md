@@ -28,6 +28,13 @@ $env:GEMINI_API_KEY = [System.Net.NetworkCredential]::new('', (Read-Host 'Gemini
 ./.venv/Scripts/python.exe mars_colony_3/run.py --mode gemini
 ```
 
+or in Command Prompt (CMD)
+
+```cmd
+    set GEMINI_API_KEY=your-api-key
+   ./.venv/Scripts/python.exe mars_colony_3/run.py --batch --mode gemini --seed 42 --steps 50 --max-calls 10 --request-seconds 1
+```
+
 Alternatively, set GEMINI_API_KEY in your IDE's run configuration and run
 mars_colony_3/run.py. Gemini is the default when --mode is omitted.
 GOOGLE_API_KEY is accepted as a fallback; GEMINI_API_KEY takes precedence.
