@@ -78,10 +78,10 @@ its result files; the default creates a new directory.
 
 Gemini defaults:
 
-- **20 API attempts per simulation**, shared by all collectors.
-- **15 seconds between a completed request and the next request**.
+- **120 API attempts per simulation**, shared by all collectors.
+- **1 second between a completed request and the next request**.
 - Up to **10 simulation ticks per selected journey** before reconsideration.
-- **300 output tokens maximum** per response; token usage is recorded.
+- **1,024 output tokens maximum** per response; token usage is recorded.
 
 These are conservative teaching defaults, not Google's published quota.
 Daily or token quotas can be exhausted before the local attempt ceiling.
@@ -95,26 +95,27 @@ reconsideration. A loaded collector returns automatically, as in the baseline.
 Turns with only one available action need no API call.
 
 On HTTP 429 (quota exhausted), further requests stop for the run and original
-rules provide explicitly labelled fallbacks. Failed, blocked, truncated or
-invalid responses also disable further requests. The first fallback is announced;
-all are counted and logged. Fix the cause and restart when quota is available.
-There is no paid fallback or automatic quota retry.
+rules provide explicitly labelled fallbacks. Authentication, permission,
+invalid-request and unavailable-model failures also stop calls. Temporary
+timeouts, connection/service errors, truncated output, invalid JSON and invalid
+generated decisions use fallback for that turn but allow later calls. All
+fallbacks are counted and logged. There is no paid fallback.
 
 An already-selected journey can continue within its cadence after the local
 call ceiling is reached; the next new choice uses fallback. Provider failure
 disables continuation as well.
 
 Pacing uses wall-clock time and does not advance simulation time or consume
-simulated resources. A run can take several minutes. Five seeds at 20 attempts
-permit up to 100 requests. Restarting does not reset Google's quota. Pacing is
+simulated resources. A run can take several minutes. Five seeds at 120 attempts
+permit up to 600 requests. Restarting does not reset Google's quota. Pacing is
 per run; concurrent simulations or students sharing a project share its quota.
 
 ### Configuration
 
 ```powershell
 $env:GEMINI_MODEL = 'gemini-3.1-flash-lite'
-$env:MARS_MAX_API_CALLS = '20'
-$env:MARS_GEMINI_REQUEST_SECONDS = '15'
+$env:MARS_MAX_API_CALLS = '120'
+$env:MARS_GEMINI_REQUEST_SECONDS = '1'
 $env:MARS_GEMINI_DECISION_INTERVAL = '10'
 ```
 

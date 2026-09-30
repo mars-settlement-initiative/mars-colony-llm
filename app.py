@@ -35,31 +35,32 @@ RUN_SEED = int(os.getenv("MARS_RUN_SEED", str(DEFAULT_SEED)))
 RUN_STEPS = int(os.getenv("MARS_RUN_STEPS", str(MAX_STEPS)))
 
 
-def three_column_layout(number_components):
-    """Use a roomy top row and three equally sized plots below it."""
-    top_row = [
+def dashboard_layout(number_components):
+    """Give the prompt/decision log a full-width row for readable text."""
+    primary_cards = [
         {"i": 0, "w": 4, "h": 14, "x": 0, "y": 0, "moved": False},
         {"i": 1, "w": 4, "h": 14, "x": 4, "y": 0, "moved": False},
         {"i": 2, "w": 4, "h": 14, "x": 8, "y": 0, "moved": False},
+        {"i": 3, "w": 12, "h": 32, "x": 0, "y": 14, "moved": False},
     ]
-    bottom_row = [
+    plot_row = [
         {
             "i": index,
             "w": 4,
             "h": 10,
-            "x": 4 * (index - 3),
-            "y": 14,
+            "x": 4 * (index - 4),
+            "y": 46,
             "moved": False,
         }
-        for index in range(3, number_components)
+        for index in range(4, number_components)
     ]
-    return (top_row + bottom_row)[:number_components]
+    return (primary_cards + plot_row)[:number_components]
 
 
 # Mesa 3.5 does not yet expose the initial draggable-card layout as a
 # SolaraViz argument, so configure its layout hook before creating the page.
 solara_viz_module = importlib.import_module("mesa.visualization.solara_viz")
-solara_viz_module.make_initial_grid_layout = three_column_layout
+solara_viz_module.make_initial_grid_layout = dashboard_layout
 
 
 class BaseMarkerAgent(mesa.Agent):
@@ -251,6 +252,35 @@ def agent_table(model):
         solara.DataFrame(data, items_per_page=10, scrollable=True)
 
 
+def decision_log(model):
+    """Show recent per-agent prompts and decisions recorded by the engine."""
+    engine = model.decision_engine
+    rows = [
+        {
+            "Step": record["step"],
+            "Agent": record["agent_id"],
+            "API called": record["api_called"],
+            "Source": record["source"],
+            "Action": record["action"],
+            "Reason": record["reason"],
+            "API reply": record["api_reply"],
+            "Error": record["error"] or "",
+            "Seconds": record["seconds"],
+            "Observation prompt": record["prompt"],
+        }
+        for record in reversed(engine.records[-200:])
+    ]
+    with solara.Card("Agent prompts and decisions"):
+        solara.Markdown("**System prompt used for API decisions**")
+        solara.Markdown(f"```text\n{engine.prompt}\n```")
+        if engine.csv_path is not None:
+            solara.Text(f"CSV log: {engine.csv_path}")
+        if rows:
+            solara.DataFrame(pd.DataFrame(rows), items_per_page=10, scrollable=True)
+        else:
+            solara.Text("No collector decisions have been made yet.")
+
+
 # Fixed experiment settings; reset reruns the same world and resets API budget.
 model_params = {
     "width": GRID_WIDTH, "height": GRID_HEIGHT,
@@ -274,6 +304,7 @@ page = SolaraViz(
     components=[
         (agent_table, 0),
         (mission_status, 0),
+        (decision_log, 0),
         make_plot_component(
             {"Base Resources": "#c0392b", "Resources Collected": "#27ae60"},
             page=0,

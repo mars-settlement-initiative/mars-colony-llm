@@ -1,10 +1,12 @@
 """Gemini tests use intercepted HTTP requests; no network or credentials needed."""
 
 import contextlib
+import csv
 import io
 import json
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -63,7 +65,8 @@ class GeminiTests(unittest.TestCase):
             config = body["generationConfig"]
             self.assertEqual(config["responseMimeType"], "application/json")
             self.assertEqual(config["responseJsonSchema"]["properties"]["action"]["enum"], observation()["allowed_actions"])
-            self.assertEqual(config["maxOutputTokens"], 300)
+            self.assertEqual(config["maxOutputTokens"], 1024)
+            self.assertEqual(config["thinkingConfig"], {"thinkingLevel": "minimal"})
             self.assertNotIn("tools", body)
             obs = json.loads(body["contents"][0]["parts"][0]["text"])
             self.assertNotIn("baseline_target", obs)
@@ -95,6 +98,48 @@ class GeminiTests(unittest.TestCase):
         self.assertNotIn("sensitive", json.dumps(engine.records))
         engine.close()
 
+    def test_server_error_falls_back_without_disabling_future_calls(self):
+        calls = []
+
+        def unavailable(request):
+            calls.append(request)
+            return httpx.Response(503, json={"error": {"message": "temporary"}})
+
+        engine = make_engine(unavailable)
+        with contextlib.redirect_stdout(io.StringIO()):
+            engine.decide(observation())
+            engine.decide(observation())
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(engine.api_calls, 2)
+        self.assertEqual(engine.fallbacks, 2)
+        self.assertIsNone(engine.disabled_reason)
+        engine.close()
+
+    def test_decisions_are_appended_to_csv_with_prompts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "decisions.csv"
+            client = GeminiClient(
+                "fake-test-key",
+                httpx.Client(transport=httpx.MockTransport(
+                    lambda request: httpx.Response(200, json=response_body())
+                )),
+            )
+            engine = DecisionEngine(
+                "gemini", client=client, min_request_seconds=0, csv_path=path
+            )
+            engine.decide(observation())
+            with path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["agent_id"], "15")
+            self.assertEqual(rows[0]["action"], "COLLECT_6_5")
+            self.assertEqual(
+                json.loads(rows[0]["api_reply"])["action"], "COLLECT_6_5"
+            )
+            self.assertIn("allowed_actions", rows[0]["observation_prompt"])
+            self.assertIn("next decision", rows[0]["system_prompt"])
+            engine.close()
+
     def test_rejects_blocked_truncated_and_illegal_outputs(self):
         for body in [{"promptFeedback": {"blockReason": "SAFETY"}},
                      response_body(finish="MAX_TOKENS"),
@@ -106,6 +151,16 @@ class GeminiTests(unittest.TestCase):
                 self.assertEqual(engine.llm_decisions, 0)
                 self.assertEqual(engine.fallbacks, 1)
                 engine.close()
+
+    def test_truncated_response_reports_finish_reason(self):
+        engine = make_engine(
+            lambda request: httpx.Response(200, json=response_body(finish="MAX_TOKENS"))
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            engine.decide(observation())
+        self.assertIn("MAX_TOKENS", engine.records[-1]["error"])
+        self.assertIsNone(engine.disabled_reason)
+        engine.close()
 
     def test_pacing_uses_wall_time_without_changing_simulation_tick(self):
         engine = make_engine(lambda request: httpx.Response(200, json=response_body()), decision_interval=1)

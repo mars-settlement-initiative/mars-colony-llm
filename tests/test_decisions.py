@@ -72,8 +72,7 @@ class DecisionTests(unittest.TestCase):
 
     def test_illegal_action_and_provider_error_disable_calls(self):
         for response in [httpx.Response(200, json=api_response("COLLECT_99_99")),
-                         httpx.Response(200, json=api_response(status="incomplete")),
-                         httpx.Response(401, json={"error": {"message": "test", "type": "authentication_error"}})]:
+                         httpx.Response(200, json=api_response(status="incomplete"))]:
             with self.subTest(status=response.status_code):
                 with OpenAI(api_key="test-not-a-real-key", max_retries=0,
                             http_client=httpx.Client(transport=httpx.MockTransport(lambda request: response))) as client:
@@ -82,8 +81,20 @@ class DecisionTests(unittest.TestCase):
                         first = engine.decide(observation())
                         engine.decide(observation())
                     self.assertEqual(first, baseline_decision(observation()))
-                    self.assertEqual(engine.api_calls, 1)
+                    self.assertEqual(engine.api_calls, 2)
                     self.assertEqual(engine.fallbacks, 2)
+                    self.assertIsNone(engine.disabled_reason)
+
+        response = httpx.Response(401, json={"error": {"message": "test", "type": "authentication_error"}})
+        with OpenAI(api_key="test-not-a-real-key", max_retries=0,
+                    http_client=httpx.Client(transport=httpx.MockTransport(lambda request: response))) as client:
+            engine = DecisionEngine("openai", client=client)
+            with contextlib.redirect_stdout(io.StringIO()):
+                engine.decide(observation())
+                engine.decide(observation())
+            self.assertEqual(engine.api_calls, 1)
+            self.assertEqual(engine.fallbacks, 2)
+            self.assertIsNotNone(engine.disabled_reason)
 
     def test_local_validation_rejects_invalid_shapes(self):
         for bad in [None, [], {"action": "WAIT"},
@@ -163,4 +174,3 @@ class DecisionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

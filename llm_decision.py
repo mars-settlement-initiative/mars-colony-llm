@@ -1,6 +1,7 @@
 """Observation -> validated action. No model mutation or generated code here."""
 
 import hashlib
+import csv
 import json
 import math
 import os
@@ -11,6 +12,30 @@ from llm_config import (
     API_TIMEOUT_SECONDS, LLM_MODE, MAX_API_CALLS, MAX_OUTPUT_TOKENS,
     GEMINI_MIN_REQUEST_SECONDS, GEMINI_DECISION_INTERVAL, default_model,
 )
+
+
+class DecisionResponseError(Exception):
+    """A safe description of a provider response that can be retried later."""
+
+
+def permanent_provider_failure(exc):
+    """Return whether retrying this provider during the run cannot help."""
+    from gemini_client import GeminiError
+
+    if isinstance(exc, GeminiError):
+        return exc.permanent
+    status_code = getattr(exc, "status_code", None)
+    if status_code is not None:
+        return 400 <= status_code < 500 and status_code not in {408, 409, 429}
+    if isinstance(exc, DecisionResponseError):
+        return False
+    # OpenAI connection, timeout and server errors have these stable class names.
+    if type(exc).__name__ in {
+        "APIConnectionError", "APITimeoutError", "InternalServerError",
+        "RateLimitError",
+    }:
+        return False
+    return True
 
 
 def collect_action(position):
@@ -48,7 +73,8 @@ class DecisionEngine:
 
     def __init__(self, mode=LLM_MODE, model_name=None,
                  max_calls=MAX_API_CALLS, client=None, prompt_path=None,
-                 min_request_seconds=None, decision_interval=None):
+                 min_request_seconds=None, decision_interval=None, csv_path=None,
+                 progress_callback=None):
         if mode not in {"mock", "openai", "gemini"}:
             raise ValueError("Mode must be mock, gemini or openai.")
         if max_calls < 0:
@@ -75,6 +101,9 @@ class DecisionEngine:
         self.input_tokens = 0
         self.output_tokens = 0
         self.records = []
+        configured_csv = csv_path or os.getenv("MARS_DECISIONS_CSV")
+        self.csv_path = Path(configured_csv) if configured_csv else None
+        self.progress_callback = progress_callback
         self.disabled_reason = None
         if mode == "gemini" and client is None:
             key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
@@ -104,15 +133,21 @@ class DecisionEngine:
         }
         # baseline_target is used only by the demo/fallback; do not give the
         # LLM a suggested answer. All factual state is still in the observation.
-        llm_observation = {k: v for k, v in observation.items() if k not in {"baseline_target", "return_threshold"}}
-        llm_observation["decision_interval_ticks"] = self.decision_interval
+        llm_observation = self.provider_observation(observation)
         if self.mode == "gemini":
             response = self.client.generate(self.model_name, self.prompt, llm_observation, schema)
             self.input_tokens += response["input_tokens"] or 0
             self.output_tokens += response["output_tokens"] or 0
             if not response["complete"] or not response["text"]:
-                raise ValueError("Gemini response incomplete or blocked.")
-            return json.loads(response["text"])
+                from gemini_client import GeminiError
+                raise GeminiError(
+                    f"Gemini response stopped with {response['finish_reason']}"
+                )
+            try:
+                return json.loads(response["text"])
+            except json.JSONDecodeError as exc:
+                from gemini_client import GeminiError
+                raise GeminiError("Gemini returned invalid JSON") from exc
         response = self.client.responses.create(
             model=self.model_name,
             instructions=self.prompt,
@@ -125,9 +160,57 @@ class DecisionEngine:
         self.input_tokens += getattr(usage, "input_tokens", 0) or 0
         self.output_tokens += getattr(usage, "output_tokens", 0) or 0
         if response.status != "completed" or not response.output_text:
-            raise ValueError("Response incomplete or refused.")
-        return json.loads(response.output_text)
+            raise DecisionResponseError("OpenAI response incomplete or refused")
+        try:
+            return json.loads(response.output_text)
+        except json.JSONDecodeError as exc:
+            raise DecisionResponseError("OpenAI returned invalid JSON") from exc
 
+    def provider_observation(self, observation):
+        """Return exactly the per-agent observation included in an API prompt."""
+        llm_observation = {
+            key: value for key, value in observation.items()
+            if key not in {"baseline_target", "return_threshold"}
+        }
+        llm_observation["decision_interval_ticks"] = self.decision_interval
+        return llm_observation
+
+    def append_csv_record(self, record):
+        """Append one decision to the interactive CSV log, when configured."""
+        if self.csv_path is None:
+            return
+        self.csv_path.parent.mkdir(parents=True, exist_ok=True)
+        write_header = not self.csv_path.exists() or self.csv_path.stat().st_size == 0
+        with self.csv_path.open("a", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=self.csv_fieldnames())
+            if write_header:
+                writer.writeheader()
+            writer.writerow(self.csv_row(record))
+
+    @staticmethod
+    def csv_fieldnames():
+        return [
+            "step", "agent_id", "mode", "model", "api_called", "source", "action",
+            "reason", "api_reply", "error", "seconds", "system_prompt",
+            "observation_prompt",
+        ]
+
+    def csv_row(self, record):
+        return {
+            "step": record["step"],
+            "agent_id": record["agent_id"],
+            "mode": self.mode,
+            "model": self.model_name if self.mode != "mock" else "none",
+            "api_called": record["api_called"],
+            "source": record["source"],
+            "action": record["action"],
+            "reason": record["reason"],
+            "api_reply": record["api_reply"],
+            "error": record["error"] or "",
+            "seconds": record["seconds"],
+            "system_prompt": self.prompt,
+            "observation_prompt": record["prompt"],
+        }
     def continued_choice(self, observation):
         """Continue a previously validated journey for a bounded number of ticks.
 
@@ -167,6 +250,8 @@ class DecisionEngine:
     def decide(self, observation):
         started = time.perf_counter()
         error = None
+        failed_permanently = None
+        api_called = False
         fallback = baseline_decision(observation)
         continued = self.continued_choice(observation)
         if self.mode == "mock":
@@ -183,33 +268,50 @@ class DecisionEngine:
             error = self.disabled_reason or "API call budget exhausted"
         else:
             try:
+                if self.progress_callback is not None:
+                    self.progress_callback(self.api_calls + 1, self.max_calls)
                 self.wait_for_request_slot()
                 self.api_calls += 1
-                decision = validate_decision(self.request_decision(observation), observation)
+                api_called = True
+                try:
+                    decision = validate_decision(self.request_decision(observation), observation)
+                except ValueError as exc:
+                    raise DecisionResponseError(
+                        f"Provider decision rejected: {exc}"
+                    ) from exc
                 source = "llm"
                 self.llm_decisions += 1
                 self._last_llm_choice[observation["agent_id"]] = (observation["step"], decision)
             except Exception as exc:
                 # Never log raw provider errors: they may contain request data.
                 from gemini_client import GeminiError
-                error = str(exc) if isinstance(exc, GeminiError) else type(exc).__name__
+                error = str(exc) if isinstance(exc, (GeminiError, DecisionResponseError)) else type(exc).__name__
                 decision, source = fallback, "fallback"
-                # Stop repeatedly calling a failing provider during this run.
-                self.disabled_reason = f"Provider disabled after {error}; restart the run after fixing it"
+                failed_permanently = permanent_provider_failure(exc)
+                if failed_permanently:
+                    self.disabled_reason = f"Provider disabled after {error}; restart the run after fixing it"
             finally:
                 self._next_request_at = time.monotonic() + self.min_request_seconds
         validate_decision(decision, observation)
         if source == "fallback":
             self.fallbacks += 1
-            if self.fallbacks == 1:
+            if failed_permanently is False:
+                print(f"LLM fallback: {error}. Future API calls remain enabled.")
+            elif failed_permanently is True:
+                print(f"LLM fallback: {error}. Further API calls are disabled for this run.")
+            elif self.fallbacks == 1:
                 print(f"LLM fallback: {error}. Remaining fallback decisions are counted in the report.")
         record = {
             "step": observation["step"], "agent_id": observation["agent_id"],
             "source": source, **decision, "error": error,
+            "api_called": api_called,
+            "api_reply": json.dumps(decision, ensure_ascii=False) if source == "llm" else "",
             "seconds": round(time.perf_counter() - started, 4),
+            "prompt": json.dumps(self.provider_observation(observation), sort_keys=True),
             "observation": observation,
         }
         self.records.append(record)
+        self.append_csv_record(record)
         return decision
 
     def summary(self):
@@ -233,3 +335,11 @@ class DecisionEngine:
         with path.open("w", encoding="utf-8") as handle:
             for record in self.records:
                 handle.write(json.dumps(record) + "\n")
+
+    def save_csv(self, path):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=self.csv_fieldnames())
+            writer.writeheader()
+            writer.writerows(self.csv_row(record) for record in self.records)

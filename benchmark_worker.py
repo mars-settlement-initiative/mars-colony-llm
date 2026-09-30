@@ -41,7 +41,17 @@ def main():
         model_type = importlib.import_module("model").MarsColonyModel
         if folder == Path(__file__).parent.resolve():
             from llm_decision import DecisionEngine
-            engine = DecisionEngine(args.mode, args.model, args.max_calls)
+            def report_request(number, maximum):
+                print(
+                    f"  seed {args.seed}: API request {number}/{maximum}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+            engine = DecisionEngine(
+                args.mode, args.model, args.max_calls,
+                progress_callback=report_request,
+            )
         kwargs = {"seed": args.seed}
         if engine is not None:
             kwargs["decision_engine"] = engine
@@ -56,6 +66,7 @@ def main():
         report.update(engine.summary())
         if args.output:
             engine.save_log(args.output / f"seed_{args.seed}_decisions.jsonl")
+            engine.save_csv(args.output / f"seed_{args.seed}_decisions.csv")
             (args.output / "prompt.txt").write_text(engine.prompt, encoding="utf-8")
         engine.close()
     else:

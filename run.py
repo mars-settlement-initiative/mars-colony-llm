@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from config import DEFAULT_SEED, MAX_STEPS
-from llm_config import LLM_MODE, MAX_API_CALLS
+from llm_config import GEMINI_MIN_REQUEST_SECONDS, LLM_MODE, MAX_API_CALLS
 from llm_decision import DecisionEngine
 from metrics import simulate
 from model import MarsColonyModel
@@ -29,6 +29,7 @@ def run_batch(max_steps, seed, engine, output):
     output.mkdir(parents=True, exist_ok=True)
     (output / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     engine.save_log(output / "decisions.jsonl")
+    engine.save_csv(output / "decisions.csv")
     (output / "prompt.txt").write_text(engine.prompt, encoding="utf-8")
     model.datacollector.get_model_vars_dataframe().to_csv(output / "timeseries.csv", index_label="step")
     print("\nMARS COLONY — MISSION 2: AI REASONING")
@@ -44,13 +45,22 @@ def main():
     parser.add_argument("--mode", choices=["gemini", "mock", "openai"], default=LLM_MODE)
     parser.add_argument("--model", help="provider model (default: Gemini Flash-Lite or OpenAI GPT-4o mini)")
     parser.add_argument("--max-calls", type=int, default=MAX_API_CALLS)
+    parser.add_argument(
+        "--request-seconds", type=float, default=GEMINI_MIN_REQUEST_SECONDS,
+        help="minimum wall-clock seconds between Gemini requests",
+    )
     parser.add_argument("--steps", type=positive_int, default=MAX_STEPS)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--port", type=positive_int, default=8767)
     parser.add_argument("--output", type=Path, default=Path(__file__).parent / "results" / datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
     args = parser.parse_args()
+    if args.request_seconds < 0:
+        parser.error("--request-seconds must be nonnegative")
     try:
-        engine = DecisionEngine(args.mode, args.model, args.max_calls)
+        engine = DecisionEngine(
+            args.mode, args.model, args.max_calls,
+            min_request_seconds=args.request_seconds,
+        )
     except ValueError as exc:
         parser.error(str(exc))
     print("Offline demo: coded rules, no LLM calls." if args.mode == "mock" else f"{args.mode.title()}: {engine.model_name}; up to {args.max_calls} calls per run.")
@@ -66,7 +76,11 @@ def main():
         env = os.environ.copy()
         env.update(MARS_LLM_MODE=args.mode,
                    MARS_MAX_API_CALLS=str(args.max_calls), MARS_RUN_SEED=str(args.seed),
-                   MARS_RUN_STEPS=str(args.steps))
+                   MARS_RUN_STEPS=str(args.steps),
+                   MARS_GEMINI_REQUEST_SECONDS=str(args.request_seconds))
+        decision_csv = (args.output / "decisions.csv").resolve()
+        env["MARS_DECISIONS_CSV"] = str(decision_csv)
+        print(f"Decision CSV: {decision_csv}")
         env["GEMINI_MODEL" if args.mode == "gemini" else "OPENAI_MODEL"] = engine.model_name
         app = Path(__file__).with_name("app.py")
         raise SystemExit(subprocess.call([
